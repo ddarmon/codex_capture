@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Latest Codex ↔ Ollama Exchange</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <div class="container">
+      <h1>Latest Codex ↔ Ollama Exchange</h1>
+
+      <div class="meta">
+        <span>Last updated: <strong id="lastUpdated" data-epoch="{{ last_mtime|default(0, true) }}">{{ last_mtime_iso }}</strong></span>
+        <span class="spacer">•</span>
+        <label for="autoRefresh">Auto-refresh</label>
+        <select id="autoRefresh" class="select">
+          <option value="0">Off</option>
+          <option value="5">5s</option>
+          <option value="10">10s</option>
+          <option value="30">30s</option>
+        </select>
+        <button id="pauseBtn" class="btn" style="margin-left:8px;">Pause</button>
+      </div>
+
+      <div class="navline">
+        <a class="btn btn-small" href="/">Latest</a>
+        {% if prev_idx is not none %}
+          <a class="btn btn-small" href="/capture/{{ prev_idx }}">Prev</a>
+        {% else %}
+          <button class="btn btn-small" disabled>Prev</button>
+        {% endif %}
+        {% if next_idx is not none %}
+          <a class="btn btn-small" href="/capture/{{ next_idx }}">Next</a>
+        {% else %}
+          <button class="btn btn-small" disabled>Next</button>
+        {% endif %}
+        {% if history %}
+          <span class="spacer">•</span>
+          <label for="historySelect">History</label>
+          <select id="historySelect" class="select">
+            <option value="">— select —</option>
+            {% for h in history %}
+              <option value="{{ h.idx }}" {% if current_idx is not none and h.idx == current_idx %}selected{% endif %}>#{{ h.idx }} | {{ h.ts_iso }} | {{ h.model }} | {{ h.status }}</option>
+            {% endfor %}
+          </select>
+          <button id="goHist" class="btn btn-small">Go</button>
+        {% endif %}
+        {% if current_idx is not none %}
+          <span class="spacer">•</span>
+          <span>Viewing capture: #{{ current_idx }} at {{ view_ts_iso }}</span>
+        {% elif is_latest %}
+          <span class="spacer">•</span>
+          <span>Viewing latest</span>
+        {% endif %}
+      </div>
+
+      {% if not data %}
+        <p>No capture yet. Generate traffic through mitmproxy and refresh.</p>
+        <div class="toolbar">
+          <button class="btn" onclick="location.reload()">Refresh</button>
+        </div>
+      {% else %}
+        <div class="toolbar">
+          <button class="btn" onclick="location.reload()">Refresh</button>
+          <a class="btn" href="/raw/latest.json" target="_blank">Download latest.json</a>
+          <a class="btn" href="/raw/request" target="_blank">Raw request</a>
+          <a class="btn" href="/raw/response" target="_blank">Raw response</a>
+        </div>
+
+        {% set status = data.summary.status_code or 0 %}
+        {% set status_class = 'badge-green' if 200 <= status < 300 else ('badge-yellow' if 300 <= status < 400 else ('badge-red' if status >= 400 else 'badge-slate')) %}
+
+        <section>
+          <h2>Human‑Readable Summary</h2>
+
+          <div class="summary-badges">
+            <span class="badge badge-slate" title="HTTP Method">{{ (data.summary.method or '').upper() }}</span>
+            <span class="badge {{ status_class }}" title="HTTP Status">{{ data.summary.status_code }}</span>
+            <span class="badge {{ 'badge-blue' if data.summary.is_stream else 'badge-slate' }}" title="Streamed">{{ 'stream' if data.summary.is_stream else 'batch' }}</span>
+            <span class="badge badge-purple" title="Model">{{ data.summary.model }}</span>
+          </div>
+
+          <div class="kv">
+            <div><span class="k">Endpoint</span><span class="v truncate" title="{{ data.summary.endpoint }}">{{ data.summary.endpoint }}</span></div>
+            <div><span class="k">Messages</span><span class="v">{{ data.summary.messages_count }}</span></div>
+            <div><span class="k">Tools</span><span class="v">{{ data.summary.tools_count }}</span></div>
+            <div><span class="k">System prompt chars</span><span class="v">{{ data.summary.system_prompt_chars }}</span></div>
+            <div><span class="k">Latency (ms)</span><span class="v">{{ data.summary.duration_ms }}</span></div>
+          </div>
+
+          {% if data.summary.last_user_message_preview %}
+          <h3>Last user message (preview) <button id="copyUserMsg" class="btn btn-small">Copy</button></h3>
+          <pre id="userMsg" class="prewrap">{{ data.summary.last_user_message_preview }}</pre>
+          {% endif %}
+
+          {% if data.summary.assistant_reasoning_preview %}
+          <h3>Assistant reasoning (reconstructed preview) <button id="copyAssistReason" class="btn btn-small">Copy</button></h3>
+          <pre id="assistReason" class="prewrap">{{ data.summary.assistant_reasoning_preview }}</pre>
+          {% endif %}
+          {% if data.summary.assistant_text_preview %}
+          <h3>Assistant output (reconstructed preview) <button id="copyAssist" class="btn btn-small">Copy</button></h3>
+          <pre id="assistOut" class="prewrap">{{ data.summary.assistant_text_preview }}</pre>
+          {% endif %}
+        </section>
+
+        {% set req = data.request.json if data.request.json else None %}
+        {% if req and req.messages %}
+        <section>
+          <h2>
+            Conversation
+            <span class="viewer-controls">
+              <label><input type="checkbox" id="toggleSystem"> Show system</label>
+            </span>
+          </h2>
+          {% if req.tools %}
+            <div class="toolnote">Tools available: {{ (req.tools | length) }}
+              <details class="inline">
+                <summary>view</summary>
+                <pre class="code">{{ req.tools | tojson(indent=2) }}</pre>
+              </details>
+            </div>
+          {% endif %}
+
+          <div id="chat" class="chat hide-system">
+            {% for m in req.messages %}
+              {% set role = (m.role or 'message') | string %}
+              <div class="msg {{ 'user' if role=='user' else ('assistant' if role=='assistant' else ('system' if role=='system' else 'tool')) }}">
+                <div class="meta-line">
+                  {% if role == 'tool' and m.name %}
+                    <span class="pill">tool: {{ m.name }}</span>
+                  {% else %}
+                    <span class="pill">{{ role }}</span>
+                  {% endif %}
+                </div>
+                {% if m.content is string %}
+                  <div class="bubble">{{ m.content }}</div>
+                {% else %}
+                  <div class="bubble"><pre class="prewrap">{{ m.content | tojson(indent=2) }}</pre></div>
+                {% endif %}
+                {% if m.tool_calls %}
+                  <div class="toolchips">
+                    {% for tc in m.tool_calls %}
+                      {% set fname = (tc.function.name if tc.function and tc.function.name else (tc.name if tc.name else 'function')) %}
+                      {% set fargs = (tc.function.arguments if tc.function and tc.function.arguments else (tc.arguments if tc.arguments else '')) %}
+                      <span class="chip" title="{{ fargs }}"><span class="fn">{{ fname }}</span>(<span class="args">{{ fargs[:140] }}{% if fargs and fargs|length > 140 %}…{% endif %}</span>)</span>
+                    {% endfor %}
+                  </div>
+                  <div class="toolcalls">
+                    <details>
+                      <summary>tool_calls JSON ({{ m.tool_calls | length }})</summary>
+                      <pre class="prewrap">{{ m.tool_calls | tojson(indent=2) }}</pre>
+                    </details>
+                  </div>
+                {% endif %}
+              </div>
+            {% endfor %}
+          </div>
+        </section>
+        {% endif %}
+
+        <section>
+          <h2>API‑Native View</h2>
+          <h3>
+            Request JSON
+            {% if data.request.json %}
+              <span class="viewer-controls">
+                <label><input type="radio" name="reqView" value="tree" checked> Tree</label>
+                <label><input type="radio" name="reqView" value="raw"> Raw</label>
+                <button id="copyReq" class="btn btn-small">Copy</button>
+                <button id="expReq" class="btn btn-small">Expand all</button>
+                <button id="colReq" class="btn btn-small">Collapse all</button>
+              </span>
+            {% else %}
+              <button id="copyReqRawOnly" class="btn btn-small">Copy</button>
+            {% endif %}
+          </h3>
+
+          {% if data.request.json %}
+            <script id="reqJsonData" type="application/json">{{ data.request.json | tojson }}</script>
+            <div id="reqViewerTree" class="json-tree"></div>
+            <pre id="reqViewerRaw" class="code" style="display:none;">{{ data.request.json | tojson(indent=2) }}</pre>
+          {% else %}
+            <pre id="reqViewerRawOnly" class="code">{{ data.request.body_text }}</pre>
+          {% endif %}
+
+          <h3>Response</h3>
+          {% set ct = data.response.headers.get('content-type', '') %}
+          {% if 'text/event-stream' in ct or data.response.body_text.startswith('data:') %}
+            <p>
+              Streamed (SSE). Showing raw event stream.
+              <button id="copyRespSSE" class="btn btn-small" style="margin-left:8px;">Copy</button>
+            </p>
+            <pre id="respViewerSSE" class="code">{{ data.response.body_text }}</pre>
+            {% if data.response.events %}
+              <h4 class="subtle">SSE Timeline
+                <span class="viewer-controls">
+                  <label><input type="checkbox" id="showContent" checked> content</label>
+                  <label><input type="checkbox" id="showReason" checked> reasoning</label>
+                  <label><input type="checkbox" id="wrapSse" checked> wrap</label>
+                  <button id="copyAggContent" class="btn btn-small">Copy content</button>
+                  <button id="copyAggReason" class="btn btn-small">Copy reasoning</button>
+                  <button id="scrollLast" class="btn btn-small">Scroll to last</button>
+                </span>
+              </h4>
+              <script id="sseEvents" type="application/json">{{ data.response.events | tojson }}</script>
+              <div id="sseTimeline" class="timeline"></div>
+            {% endif %}
+          {% else %}
+            {% set parsed = data.response.body_text %}
+            {% if data.response.body_text.strip().startswith('{') %}
+              {% set parsed = data.response.body_text %}
+            {% endif %}
+            <h4 class="subtle">
+              JSON
+              <span class="viewer-controls">
+                <label><input type="radio" name="respView" value="tree" checked> Tree</label>
+                <label><input type="radio" name="respView" value="raw"> Raw</label>
+                <button id="copyResp" class="btn btn-small">Copy</button>
+                <button id="expResp" class="btn btn-small">Expand all</button>
+                <button id="colResp" class="btn btn-small">Collapse all</button>
+              </span>
+            </h4>
+            <script id="respJsonData" type="application/json">{{ parsed }}</script>
+            <div id="respViewerTree" class="json-tree"></div>
+            <pre id="respViewerRaw" class="code" style="display:none;">{{ parsed }}</pre>
+          {% endif %}
+        </section>
+
+        <section>
+          <h2>HTTP Headers</h2>
+          <div class="columns">
+            <div>
+              <h3>Request Headers</h3>
+              <pre class="prewrap">{{ data.request.headers | tojson(indent=2) }}</pre>
+            </div>
+            <div>
+              <h3>Response Headers</h3>
+              <pre class="prewrap">{{ data.response.headers | tojson(indent=2) }}</pre>
+            </div>
+          </div>
+        </section>
+      {% endif %}
+    </div>
+    <script>
+      (function() {
+        const sel = document.getElementById('autoRefresh');
+        const btn = document.getElementById('pauseBtn');
+        let timer = null;
+        let paused = false;
+
+        const last = document.getElementById('lastUpdated');
+        let baseEpoch = parseFloat((last && last.dataset.epoch) || '0');
+        async function tick(){
+          try {
+            const r = await fetch('/api/last-updated');
+            const j = await r.json();
+            if (j && typeof j.mtime === 'number' && j.mtime > baseEpoch) {
+              location.reload();
+            }
+          } catch (e) { /* ignore */ }
+        }
+        function apply() {
+          if (timer) { clearInterval(timer); timer = null; }
+          const sec = parseInt(sel.value || '0', 10);
+          if (!paused && sec > 0) {
+            timer = setInterval(tick, sec * 1000);
+          }
+          localStorage.setItem('autoRefreshSec', String(sec));
+          localStorage.setItem('autoRefreshPaused', paused ? '1' : '0');
+          btn.textContent = paused ? 'Resume' : 'Pause';
+        }
+
+        // Init from storage
+        const saved = localStorage.getItem('autoRefreshSec');
+        if (saved !== null) sel.value = saved;
+        paused = localStorage.getItem('autoRefreshPaused') === '1';
+        apply();
+
+        sel.addEventListener('change', apply);
+        btn.addEventListener('click', () => { paused = !paused; apply(); });
+        const selHist = document.getElementById('historySelect');
+        const goHist = document.getElementById('goHist');
+        if (selHist && goHist) {
+          goHist.addEventListener('click', () => { const v = selHist.value; if (v) location.href = '/capture/' + v; });
+          selHist.addEventListener('change', () => { const v = selHist.value; if (v) location.href = '/capture/' + v; });
+        }
+      })();
+    </script>
+    <script>
+      // Minimal JSON tree renderer and copy helpers
+      (function(){
+        function el(tag, cls, text){ const e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=text; return e; }
+        function renderNode(key, value){
+          const container=document.createElement('div');
+          if (value!==null && typeof value==='object'){
+            const isArr=Array.isArray(value); const count=isArr?value.length:Object.keys(value).length;
+            const det=document.createElement('details'); det.open=false;
+            const sum=document.createElement('summary');
+            sum.appendChild(el('span','jt-key',key)); sum.appendChild(document.createTextNode(': '));
+            sum.appendChild(el('span','jt-type',isArr?`Array(${count})`:`Object(${count})`));
+            det.appendChild(sum);
+            const wrap=el('div','jt-children');
+            if (isArr){ value.forEach((v,i)=>wrap.appendChild(renderNode(String(i),v))); }
+            else { Object.entries(value).forEach(([k,v])=>wrap.appendChild(renderNode(k,v))); }
+            det.appendChild(wrap); container.appendChild(det);
+          } else {
+            const row=el('div','jt-row'); row.appendChild(el('span','jt-key',key)); row.appendChild(document.createTextNode(': ')); row.appendChild(el('span','jt-val',String(value))); container.appendChild(row);
+          }
+          return container;
+        }
+        function renderTree(targetId, json){ const root=document.getElementById(targetId); if(!root) return; root.innerHTML=''; const top=renderNode('(root)', json); const det=top.querySelector('details'); if(det) det.open=true; root.appendChild(top); }
+        function bindViewer(prefix){
+          const dataEl=document.getElementById(prefix+"JsonData"); if(!dataEl) return; let json; try{ json=JSON.parse(dataEl.textContent); }catch(e){ return; }
+          renderTree(prefix+"ViewerTree", json);
+          const radios=document.querySelectorAll(`input[name="${prefix==='req'?'reqView':'respView'}"]`);
+          const tree=document.getElementById(prefix+"ViewerTree"); const raw=document.getElementById(prefix+"ViewerRaw");
+          radios.forEach(r=>r.addEventListener('change',()=>{ const v=document.querySelector(`input[name="${prefix==='req'?'reqView':'respView'}"]:checked`).value; if(v==='tree'){ tree.style.display='block'; raw.style.display='none'; } else { tree.style.display='none'; raw.style.display='block'; } }));
+          const copyBtn=document.getElementById(prefix==='req'?'copyReq':'copyResp'); if(copyBtn) copyBtn.addEventListener('click', async ()=>{ try{ await navigator.clipboard.writeText(JSON.stringify(json,null,2)); }catch(e){} });
+          function setAll(open){ tree.querySelectorAll('details').forEach(d=>{ d.open=open; }); if(!open){ const root=tree.querySelector('details'); if(root) root.open=true; } }
+          const exp=document.getElementById(prefix==='req'?'expReq':'expResp'); if(exp) exp.addEventListener('click',()=>setAll(true));
+          const col=document.getElementById(prefix==='req'?'colReq':'colResp'); if(col) col.addEventListener('click',()=>setAll(false));
+        }
+        function copyFrom(id){ const el=document.getElementById(id); if(!el) return; navigator.clipboard.writeText(el.textContent||''); }
+        const copyReqRawOnly=document.getElementById('copyReqRawOnly'); if(copyReqRawOnly) copyReqRawOnly.addEventListener('click',()=>copyFrom('reqViewerRawOnly'));
+        const copyRespSSE=document.getElementById('copyRespSSE'); if(copyRespSSE) copyRespSSE.addEventListener('click',()=>copyFrom('respViewerSSE'));
+        const copyUserMsg=document.getElementById('copyUserMsg'); if(copyUserMsg) copyUserMsg.addEventListener('click',()=>copyFrom('userMsg'));
+        const copyAssist=document.getElementById('copyAssist'); if(copyAssist) copyAssist.addEventListener('click',()=>copyFrom('assistOut'));
+        bindViewer('req'); bindViewer('resp');
+      })();
+    </script>
+    <script>
+      // Conversation controls: show/hide system messages (persisted)
+      (function(){
+        const chat = document.getElementById('chat');
+        const cb = document.getElementById('toggleSystem');
+        if (!chat || !cb) return;
+        const saved = localStorage.getItem('showSystemMsgs') === '1';
+        if (saved) { chat.classList.remove('hide-system'); cb.checked = true; }
+        function apply(){
+          if (cb.checked) { chat.classList.remove('hide-system'); localStorage.setItem('showSystemMsgs','1'); }
+          else { chat.classList.add('hide-system'); localStorage.setItem('showSystemMsgs','0'); }
+        }
+        cb.addEventListener('change', apply);
+      })();
+    </script>
+    <script>
+      // Append assistant reasoning and content to Conversation when available (prefer reconstructed previews)
+      (function(){
+        const chat = document.getElementById('chat');
+        if (!chat) return;
+        // Prefer reconstructed previews for consistency
+        function fromPreview(id){ const el = document.getElementById(id); return el ? (el.textContent || '').trim() : ''; }
+        function aggregateReasoningFromSse() {
+          const el = document.getElementById('sseEvents');
+          if (!el) return '';
+          let events; try { events = JSON.parse(el.textContent || '[]'); } catch(e) { return ''; }
+          let out = '';
+          (events || []).forEach(ev => {
+            if (!ev || ev.type !== 'data') return;
+            const obj = ev.json || {};
+            const choices = Array.isArray(obj.choices) ? obj.choices : [];
+            choices.forEach(ch => {
+              const d = ch && ch.delta || {};
+              if (typeof d.reasoning === 'string') out += d.reasoning;
+            });
+          });
+          return out;
+        }
+        function aggregateReasoningFromJson() {
+          const r = document.getElementById('respJsonData');
+          if (!r) return '';
+          let obj; try { obj = JSON.parse(r.textContent || '{}'); } catch(e) { return ''; }
+          let out = '';
+          const choices = Array.isArray(obj.choices) ? obj.choices : [];
+          choices.forEach(ch => {
+            // Try common locations for reasoning
+            if (ch && typeof ch.reasoning === 'string') out += ch.reasoning;
+            const msg = ch && ch.message || {};
+            if (msg && typeof msg.reasoning === 'string') out += msg.reasoning;
+            const d = ch && ch.delta || {};
+            if (d && typeof d.reasoning === 'string') out += d.reasoning;
+          });
+          if (!out && typeof obj.reasoning === 'string') out = obj.reasoning;
+          return out;
+        }
+        function aggregateContentFromSse(){
+          const el = document.getElementById('sseEvents');
+          if (!el) return '';
+          let events; try { events = JSON.parse(el.textContent || '[]'); } catch(e) { return ''; }
+          let out = '';
+          (events || []).forEach(ev => {
+            if (!ev || ev.type !== 'data') return;
+            const obj = ev.json || {};
+            const choices = Array.isArray(obj.choices) ? obj.choices : [];
+            choices.forEach(ch => {
+              const d = ch && ch.delta || {};
+              if (typeof d.content === 'string') out += d.content;
+              if (typeof d.text === 'string') out += d.text;
+            });
+          });
+          return out;
+        }
+        function aggregateContentFromJson(){
+          const r = document.getElementById('respJsonData');
+          if (!r) return '';
+          let obj; try { obj = JSON.parse(r.textContent || '{}'); } catch(e) { return ''; }
+          let out = '';
+          const choices = Array.isArray(obj.choices) ? obj.choices : [];
+          choices.forEach(ch => {
+            const msg = ch && ch.message || {};
+            if (msg && typeof msg.content === 'string') out += msg.content;
+            if (typeof ch.text === 'string') out += ch.text;
+          });
+          return out;
+        }
+
+        const reasoning = (fromPreview('assistReason') || aggregateReasoningFromSse() || aggregateReasoningFromJson() || '').trim();
+        const content = (fromPreview('assistOut') || aggregateContentFromSse() || aggregateContentFromJson() || '').trim();
+        if (!reasoning && !content) return;
+        if (reasoning){
+          const msgR = document.createElement('div'); msgR.className = 'msg assistant';
+          const metaR = document.createElement('div'); metaR.className = 'meta-line';
+          const pillR = document.createElement('span'); pillR.className = 'pill'; pillR.textContent = 'assistant reasoning';
+          metaR.appendChild(pillR); msgR.appendChild(metaR);
+          const bubbleR = document.createElement('div'); bubbleR.className = 'bubble prewrap bubble-reasoning'; bubbleR.textContent = reasoning;
+          msgR.appendChild(bubbleR);
+          chat.appendChild(msgR);
+        }
+        if (content) {
+          const msgC = document.createElement('div'); msgC.className = 'msg assistant';
+          const metaC = document.createElement('div'); metaC.className = 'meta-line';
+          const pillC = document.createElement('span'); pillC.className = 'pill'; pillC.textContent = 'assistant';
+          metaC.appendChild(pillC); msgC.appendChild(metaC);
+          const bubbleC = document.createElement('div'); bubbleC.className = 'bubble prewrap'; bubbleC.textContent = content;
+          msgC.appendChild(bubbleC);
+          chat.appendChild(msgC);
+        }
+      })();
+    </script>
+    <script>
+      // SSE timeline: show per-chunk content vs reasoning and aggregate copy buttons.
+      (function(){
+        const el = document.getElementById('sseEvents');
+        const host = document.getElementById('sseTimeline');
+        if (!el || !host) return;
+        let events; try { events = JSON.parse(el.textContent || '[]'); } catch(e) { events = []; }
+        const rows = [];
+        let aggContent = '';
+        let aggReason = '';
+        let count = 0;
+        events.forEach((ev, i) => {
+          if (ev.type !== 'data') return;
+          const obj = ev.json || {};
+          let contentPart = '';
+          let reasonPart = '';
+          const choices = Array.isArray(obj.choices) ? obj.choices : [];
+          choices.forEach(ch => {
+            const d = ch && ch.delta || {};
+            if (typeof d.content === 'string') contentPart += d.content;
+            if (typeof d.text === 'string') contentPart += d.text;
+            if (typeof d.reasoning === 'string') reasonPart += d.reasoning;
+          });
+          aggContent += contentPart;
+          aggReason += reasonPart;
+          const row = document.createElement('div');
+          row.className = 'tl-row';
+          const idx = document.createElement('div'); idx.className = 'tl-idx'; idx.textContent = String(i);
+          const c = document.createElement('div'); c.className = 'tl-cell tl-content'; c.textContent = contentPart || '';
+          const r = document.createElement('div'); r.className = 'tl-cell tl-reason'; r.textContent = reasonPart || '';
+          row.appendChild(idx); row.appendChild(c); row.appendChild(r);
+          rows.push(row);
+          count++;
+        });
+        const head = document.createElement('div'); head.className = 'tl-head';
+        head.innerHTML = '<div class="tl-idx">#</div><div class="tl-cell tl-content">content</div><div class="tl-cell tl-reason">reasoning</div>';
+        host.appendChild(head);
+        const stats = document.createElement('div'); stats.className = 'tl-stats';
+        stats.textContent = `chunks: ${count} · content chars: ${aggContent.length} · reasoning chars: ${aggReason.length}`;
+        host.appendChild(stats);
+        rows.forEach(r => host.appendChild(r));
+        const copyAggContent = document.getElementById('copyAggContent');
+        const copyAggReason = document.getElementById('copyAggReason');
+        if (copyAggContent) copyAggContent.addEventListener('click', ()=> navigator.clipboard.writeText(aggContent));
+        if (copyAggReason) copyAggReason.addEventListener('click', ()=> navigator.clipboard.writeText(aggReason));
+        const showContent = document.getElementById('showContent');
+        const showReason = document.getElementById('showReason');
+        const wrap = document.getElementById('wrapSse');
+        const scrollLast = document.getElementById('scrollLast');
+        function applyVis(){
+          host.classList.toggle('hide-content', !(showContent && showContent.checked));
+          host.classList.toggle('hide-reason', !(showReason && showReason.checked));
+          host.classList.toggle('nowrap', !(wrap && wrap.checked));
+        }
+        if (showContent) showContent.addEventListener('change', applyVis);
+        if (showReason) showReason.addEventListener('change', applyVis);
+        if (wrap) wrap.addEventListener('change', applyVis);
+        if (scrollLast) scrollLast.addEventListener('click', ()=> { try { rows[rows.length-1].scrollIntoView({behavior:'smooth', block:'end'}); } catch(e) {} });
+        applyVis();
+      })();
+    </script>
+  </body>
+  </html>
